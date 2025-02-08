@@ -1,63 +1,89 @@
-from airflow import DAG
-from airflow.decorators import task
-from airflow.providers.sqlite.hooks.sqlite import SqliteHook
-from datetime import datetime, timedelta
 import requests
-import pandas as pd
+import psycopg2
+from airflow import DAG
+from airflow.operators.python_operator import PythonOperator
+from datetime import datetime
 
-with DAG(
-    dag_id="weather_etl",
-    start_date=datetime(2024, 1, 1, 9),
-    schedule="@daily",
-    catchup=True,
-    max_active_runs=1,
-    default_args={
-        "retries": 3,
-        "retry_delay": timedelta(minutes=5)
+API_KEY = "3bd0125aa8cd0eada756ea251e8b2aa6"
+CITY = "São Paulo"
+
+# Configurações do PostgreSQL
+DB_CONFIG = {
+    'dbname': 'climatologia_tech',
+    'user': 'postgres',
+    'password': '1234',
+    'host': 'localhost',
+    'port': '5433'
+}
+
+@task1
+def extrair_dados():
+    url = f"https://api.openweathermap.org/data/2.5/weather?q={CITY}&appid={API_KEY}&units=metric"
+    response = requests.get(url)
+    data = response.json()
+    return data
+
+@task2
+def transformar_dados():
+    data = extrair_dados()
+    return {
+        "cidade": data["name"],
+        "temperatura": data["main"]["temp"],
+        "clima": data["weather"][0]["description"]
     }
-) as dag:
-    @task
-    def hit_weather_api(**context):
-        city = context.get("city", "Fortaleza")  # Make city configurable via context
-        api_key = context.get("api_key", "<3bd0125aa8cd0eada756ea251e8b2aa6>")  # Retrieve API key from context
+
+@task3
+def carregar_dados():
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
         
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
-        response = requests.get(url)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            raise ValueError(f"API request to {city} failed with status code: {response.status_code}")
-    
-    @task
-    def flatten_weather_data(polygon_response, **context):
-        columns = {
-            "status": None,
-            "from_datetime": context.get("ds"),
-            "latitude": polygon_response.get("lat", None),
-            "longitude": polygon_response.get("lon", None),
-            "temperature": polygon_response.get("main.temp", 0),
-            "humidity": polygon_response.get("main.humidity", 0),
-            "wind_speed": polygon_response.get("wind.speed", 0)
-        }
-        
-        return pd.DataFrame([columns], columns=list(columns.keys()))
-    
-    @task
-    def load_weather_data(flattened_dataframe, connection_name="weather_database_conn"):
-        # Use SqliteHook to get the engine
-        sqlite_hook = SqliteHook(weather_database_conn)
-        engine = sqlite_hook.get_sqlalchemy_engine()
-        
-        if not flattened_dataframe.empty:
-            flattened_dataframe.to_sql(
-                name="weather_data",
-                con=engine,
-                if_exists="append",
-                index=False
+        # Criar tabela se não existir
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clima (
+                id SERIAL PRIMARY KEY,
+                cidade VARCHAR(100),
+                temperatura DECIMAL(5,2),
+                clima VARCHAR(100),
+                data_extracao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        
+        data = transformar_dados()
+        
+        cursor.execute("""
+            INSERT INTO clima (cidade, temperatura, clima)
+            VALUES (%s, %s, %s)""", 
+            (data["cidade"], data["temperatura"], data["clima"])
+        )
+        
+        conn.commit()
+        
+    except Exception as e:
+        print(f"Erro ao conectar ao banco: {e}")
+        raise e
     
-    # Define the dependencies correctly
-    raw_weather_response = hit_weather_api(city="Fortaleza")
-    transformed_df = flatten_weather_data(raw_weather_response)
-    load_weather_data(flattened_dataframe=transformed_df)
+    finally:
+        if conn:
+            cursor.close()
+            conn.close()
+
+# Definição dos argumentos padrão do DAG
+definir_default_args = {
+    'owner': 'airflow',
+    'start_date': datetime(2025, 1, 1),
+    'retries': 1,
+}
+
+dag = DAG(
+    'weather_pipeline',
+    default_args=definir_default_args,
+    schedule_interval='@daily'
+)
+
+task1 = PythonOperator(task_id='extrair', python_callable=extrair_dados, dag=dag)
+task2 = PythonOperator(task_id='transformar', python_callable=transformar_dados, dag=dag)
+task3 = PythonOperator(task_id='carregar', python_callable=carregar_dados, dag=dag)
+
+task1 >> task2 >> task3
+
